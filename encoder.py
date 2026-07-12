@@ -23,9 +23,10 @@ import base64
 import shutil
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image, ImageTk
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import qrcode
 from qrcode.constants import ERROR_CORRECT_H
 
@@ -60,62 +61,18 @@ def _make_channel_qr(b64_text, version, fill_color):
     return qr.make_image(fill_color=fill_color, back_color="white").convert("RGB")
 
 
-def _combine_channels(img_r, img_g, img_b):
-    """Superpose 3 same-size QR images into one RGB image.
 
-    For each pixel, the output's R/G/B component is set to 255 if the
-    corresponding source QR has a "dark" (non-white) module there, else 0.
-    This is exactly reversible on the decode side.
-    """
+def _combine_channels(img_r, img_g, img_b):
     if img_r.size != img_g.size or img_r.size != img_b.size:
         raise ValueError("Channel QR images must be the same pixel size")
-
-    w, h = img_r.size
-    r_px, g_px, b_px = img_r.load(), img_g.load(), img_b.load()
-
-    out = Image.new("RGB", (w, h), (0, 0, 0))
-    out_px = out.load()
-
-    white = (255, 255, 255)
-    for y in range(h):
-        for x in range(w):
-            red_active = r_px[x, y] != white
-            green_active = g_px[x, y] != white
-            blue_active = b_px[x, y] != white
-            out_px[x, y] = (
-                255 if red_active else 0,
-                255 if green_active else 0,
-                255 if blue_active else 0,
-            )
-    return out
-
-
-def _encode_triplet(args):
-    idx, triplet, output_dir = args
-    r_bytes, g_bytes, b_bytes = triplet
-
-    v_r, r_b64 = _required_version(r_bytes)
-    v_g, g_b64 = _required_version(g_bytes)
-    v_b, b_b64 = _required_version(b_bytes)
-
-    version = max(v_r, v_g, v_b)
-
-    # Generate all three QR codes simultaneously
-    with ThreadPoolExecutor(max_workers=3) as qr_pool:
-        futures = [
-            qr_pool.submit(_make_channel_qr, r_b64, version, "red"),
-            qr_pool.submit(_make_channel_qr, g_b64, version, "green"),
-            qr_pool.submit(_make_channel_qr, b_b64, version, "blue"),
-        ]
-        img_r, img_g, img_b = [f.result() for f in futures]
-
-    combined = _combine_channels(img_r, img_g, img_b)
-
-    out_path = os.path.join(output_dir, f"{idx}.png")
-    combined.save(out_path)
-
-    return idx, out_path
-
+    r=np.array(img_r)
+    g=np.array(img_g)
+    b=np.array(img_b)
+    rw=np.any(r!=255,axis=2)
+    gw=np.any(g!=255,axis=2)
+    bw=np.any(b!=255,axis=2)
+    out=np.stack([rw,gw,bw],axis=2).astype(np.uint8)*255
+    return Image.fromarray(out,"RGB")
 
 def _chunk_file(file_bytes, chunk_size):
     if not file_bytes:
@@ -123,59 +80,46 @@ def _chunk_file(file_bytes, chunk_size):
     return [file_bytes[i:i + chunk_size] for i in range(0, len(file_bytes), chunk_size)]
 
 
+
+def _encode_triplet_worker(args):
+    idx, triplet, output_dir=args
+    r_bytes,g_bytes,b_bytes=triplet
+    v_r,r_b64=_required_version(r_bytes)
+    v_g,g_b64=_required_version(g_bytes)
+    v_b,b_b64=_required_version(b_bytes)
+    version=max(v_r,v_g,v_b)
+    img_r=_make_channel_qr(r_b64,version,"red")
+    img_g=_make_channel_qr(g_b64,version,"green")
+    img_b=_make_channel_qr(b_b64,version,"blue")
+    combined=_combine_channels(img_r,img_g,img_b)
+    out_path=os.path.join(output_dir,f"{idx}.png")
+    combined.save(out_path)
+    return idx,out_path
+
 def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=None):
-    """Encode a file into a directory of superposed QRGB PNGs + metadata.json.
-
-    Returns (list_of_image_paths, metadata_dict).
-    """
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
-
-    total_size = len(file_bytes)
-    chunks = _chunk_file(file_bytes, chunk_size)
-
-    # Group chunks into triplets of (red_bytes, green_bytes, blue_bytes)
-    triplets = []
-    for i in range(0, len(chunks), 3):
-        triplet = chunks[i:i + 3]
-        while len(triplet) < 3:
-            triplet.append(b"")
-        triplets.append(triplet)
-
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
+    with open(file_path,"rb") as f: file_bytes=f.read()
+    total_size=len(file_bytes)
+    chunks=_chunk_file(file_bytes,chunk_size)
+    triplets=[]
+    for i in range(0,len(chunks),3):
+        t=chunks[i:i+3]
+        while len(t)<3:t.append(b"")
+        triplets.append(t)
+    if os.path.exists(output_dir): shutil.rmtree(output_dir)
     os.makedirs(output_dir)
-
-    image_paths = [None] * len(triplets)
-
-
-    workers = min(os.cpu_count() or 4, len(triplets))
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(_encode_triplet, (i, triplet, output_dir))
-            for i, triplet in enumerate(triplets)
-        ]
-
-        completed = 0
-        for future in as_completed(futures):
-            idx, path = future.result()
-            image_paths[idx] = path
-            completed += 1
-    
-            if progress_callback:
-                progress_callback(completed, len(triplets))
-
-    metadata = {
-        "original_filename": os.path.basename(file_path),
-        "total_size": total_size,
-        "chunk_size": chunk_size,
-        "num_images": len(triplets),
-    }
-    with open(os.path.join(output_dir, "metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    return image_paths, metadata
+    image_paths=[None]*len(triplets)
+    workers=min(os.cpu_count() or 1,len(triplets)) or 1
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futs=[ex.submit(_encode_triplet_worker,(i,t,output_dir)) for i,t in enumerate(triplets)]
+        done=0
+        for f in as_completed(futs):
+            idx,path=f.result()
+            image_paths[idx]=path
+            done+=1
+            if progress_callback: progress_callback(done,len(triplets))
+    metadata={"original_filename":os.path.basename(file_path),"total_size":total_size,"chunk_size":chunk_size,"num_images":len(triplets)}
+    with open(os.path.join(output_dir,"metadata.json"),"w") as f: json.dump(metadata,f,indent=2)
+    return image_paths,metadata
 
 
 # --------------------------------------------------------------------------
@@ -191,13 +135,11 @@ class EncoderApp:
         self.image_paths = []
         self.current_index = 0
 
-        tk.Label(root, text="QRGB Encoder", font=(
-            "Arial", 16, "bold")).pack(pady=10)
+        tk.Label(root, text="QRGB Encoder", font=("Arial", 16, "bold")).pack(pady=10)
         tk.Button(
             root, text="Select File to Encode", command=self.select_file, width=25
         ).pack(pady=10)
-        self.status_label = tk.Label(
-            root, text="", wraplength=390, justify="left")
+        self.status_label = tk.Label(root, text="", wraplength=390, justify="left")
         self.status_label.pack(pady=10)
 
     def select_file(self):
@@ -222,8 +164,7 @@ class EncoderApp:
         self.root.update()
 
         def progress(done, total):
-            self.status_label.config(
-                text=f"Encoding QRGB code {done}/{total}...")
+            self.status_label.config(text=f"Encoding QRGB code {done}/{total}...")
             self.root.update_idletasks()
 
         try:
@@ -273,8 +214,7 @@ class EncoderApp:
                     f"{os.path.basename(path)}"
                 )
             )
-            prev_btn.config(
-                state=tk.NORMAL if self.current_index > 0 else tk.DISABLED)
+            prev_btn.config(state=tk.NORMAL if self.current_index > 0 else tk.DISABLED)
             next_btn.config(
                 state=tk.NORMAL
                 if self.current_index < len(self.image_paths) - 1
@@ -291,12 +231,10 @@ class EncoderApp:
                 self.current_index -= 1
                 render()
 
-        prev_btn = tk.Button(nav_frame, text="< Previous",
-                             command=go_prev, width=12)
+        prev_btn = tk.Button(nav_frame, text="< Previous", command=go_prev, width=12)
         prev_btn.grid(row=0, column=0, padx=5)
 
-        next_btn = tk.Button(nav_frame, text="Next >",
-                             command=go_next, width=12)
+        next_btn = tk.Button(nav_frame, text="Next >", command=go_next, width=12)
         next_btn.grid(row=0, column=1, padx=5)
 
         render()
