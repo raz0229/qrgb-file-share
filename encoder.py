@@ -23,6 +23,7 @@ import base64
 import shutil
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image, ImageTk
 import qrcode
@@ -89,6 +90,33 @@ def _combine_channels(img_r, img_g, img_b):
     return out
 
 
+def _encode_triplet(args):
+    idx, triplet, output_dir = args
+    r_bytes, g_bytes, b_bytes = triplet
+
+    v_r, r_b64 = _required_version(r_bytes)
+    v_g, g_b64 = _required_version(g_bytes)
+    v_b, b_b64 = _required_version(b_bytes)
+
+    version = max(v_r, v_g, v_b)
+
+    # Generate all three QR codes simultaneously
+    with ThreadPoolExecutor(max_workers=3) as qr_pool:
+        futures = [
+            qr_pool.submit(_make_channel_qr, r_b64, version, "red"),
+            qr_pool.submit(_make_channel_qr, g_b64, version, "green"),
+            qr_pool.submit(_make_channel_qr, b_b64, version, "blue"),
+        ]
+        img_r, img_g, img_b = [f.result() for f in futures]
+
+    combined = _combine_channels(img_r, img_g, img_b)
+
+    out_path = os.path.join(output_dir, f"{idx}.png")
+    combined.save(out_path)
+
+    return idx, out_path
+
+
 def _chunk_file(file_bytes, chunk_size):
     if not file_bytes:
         return [b""]
@@ -118,24 +146,25 @@ def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=Non
         shutil.rmtree(output_dir)
     os.makedirs(output_dir)
 
-    image_paths = []
-    for idx, (r_bytes, g_bytes, b_bytes) in enumerate(triplets):
-        v_r, r_b64 = _required_version(r_bytes)
-        v_g, g_b64 = _required_version(g_bytes)
-        v_b, b_b64 = _required_version(b_bytes)
-        version = max(v_r, v_g, v_b)
+    image_paths = [None] * len(triplets)
 
-        img_r = _make_channel_qr(r_b64, version, "red")
-        img_g = _make_channel_qr(g_b64, version, "green")
-        img_b = _make_channel_qr(b_b64, version, "blue")
 
-        combined = _combine_channels(img_r, img_g, img_b)
-        out_path = os.path.join(output_dir, f"{idx}.png")
-        combined.save(out_path)
-        image_paths.append(out_path)
+    workers = min(os.cpu_count() or 4, len(triplets))
 
-        if progress_callback:
-            progress_callback(idx + 1, len(triplets))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(_encode_triplet, (i, triplet, output_dir))
+            for i, triplet in enumerate(triplets)
+        ]
+
+        completed = 0
+        for future in as_completed(futures):
+            idx, path = future.result()
+            image_paths[idx] = path
+            completed += 1
+    
+            if progress_callback:
+                progress_callback(completed, len(triplets))
 
     metadata = {
         "original_filename": os.path.basename(file_path),
@@ -162,11 +191,13 @@ class EncoderApp:
         self.image_paths = []
         self.current_index = 0
 
-        tk.Label(root, text="QRGB Encoder", font=("Arial", 16, "bold")).pack(pady=10)
+        tk.Label(root, text="QRGB Encoder", font=(
+            "Arial", 16, "bold")).pack(pady=10)
         tk.Button(
             root, text="Select File to Encode", command=self.select_file, width=25
         ).pack(pady=10)
-        self.status_label = tk.Label(root, text="", wraplength=390, justify="left")
+        self.status_label = tk.Label(
+            root, text="", wraplength=390, justify="left")
         self.status_label.pack(pady=10)
 
     def select_file(self):
@@ -191,7 +222,8 @@ class EncoderApp:
         self.root.update()
 
         def progress(done, total):
-            self.status_label.config(text=f"Encoding QRGB code {done}/{total}...")
+            self.status_label.config(
+                text=f"Encoding QRGB code {done}/{total}...")
             self.root.update_idletasks()
 
         try:
@@ -241,7 +273,8 @@ class EncoderApp:
                     f"{os.path.basename(path)}"
                 )
             )
-            prev_btn.config(state=tk.NORMAL if self.current_index > 0 else tk.DISABLED)
+            prev_btn.config(
+                state=tk.NORMAL if self.current_index > 0 else tk.DISABLED)
             next_btn.config(
                 state=tk.NORMAL
                 if self.current_index < len(self.image_paths) - 1
@@ -258,10 +291,12 @@ class EncoderApp:
                 self.current_index -= 1
                 render()
 
-        prev_btn = tk.Button(nav_frame, text="< Previous", command=go_prev, width=12)
+        prev_btn = tk.Button(nav_frame, text="< Previous",
+                             command=go_prev, width=12)
         prev_btn.grid(row=0, column=0, padx=5)
 
-        next_btn = tk.Button(nav_frame, text="Next >", command=go_next, width=12)
+        next_btn = tk.Button(nav_frame, text="Next >",
+                             command=go_next, width=12)
         next_btn.grid(row=0, column=1, padx=5)
 
         render()
