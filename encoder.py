@@ -18,6 +18,7 @@ Run this file directly to launch the GUI.
 """
 
 import os
+import io
 import json
 import base64
 import shutil
@@ -25,54 +26,89 @@ import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
 
 from PIL import Image, ImageTk
-import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import qrcode
 from qrcode.constants import ERROR_CORRECT_L
+from qrcode.util import QRData, MODE_8BIT_BYTE
 
 DEFAULT_MAX_QR_CODE_SIZE = 2213  # bytes per channel, per QR code (ERROR_CORRECT_H=950, ERROR_CORRECT_L=2213)
 BOX_SIZE = 6
 BORDER = 4
+
+# How much encoded image data we're willing to hold in memory before we
+# flush it to disk. Keeps RAM usage bounded regardless of how many QRGB
+# images the file produces.
+DEFAULT_MEMORY_THRESHOLD_BYTES = 200 * 1024 * 1024  # 200 MB
+
+
+def _max_safe_chunk_size():
+    """Largest number of raw bytes that can be base64-encoded and still fit
+    into the biggest QR code this tool can produce (version 40, error-
+    correction L, byte mode). base64 adds ~33% overhead, so this is well
+    below the QR code's raw byte capacity.
+
+    Computed from the qrcode library's own capacity tables so it stays
+    correct if the library changes; falls back to a known-good constant
+    (verified against qrcode's tables at the time of writing) if that
+    introspection ever fails.
+    """
+    try:
+        from qrcode import util as _qru, base as _qrbase
+        version = 40
+        bit_limit = sum(b.data_count * 8 for b in _qrbase.rs_blocks(version, ERROR_CORRECT_L))
+        header_bits = 4 + _qru.length_in_bits(_qru.MODE_8BIT_BYTE, version)
+        max_b64_chars = (bit_limit - header_bits) // 8
+        best = 0
+        for x in range(max_b64_chars, 0, -1):
+            if ((x + 2) // 3) * 4 <= max_b64_chars:  # ceil(x/3)*4 <= capacity
+                best = x
+                break
+        return best
+    except Exception:
+        return 2214  # known-good fallback
+
+
+MAX_SAFE_CHUNK_SIZE = _max_safe_chunk_size()
 
 
 # --------------------------------------------------------------------------
 # Core encoding logic
 # --------------------------------------------------------------------------
 
-def _required_version(data_bytes):
-    """Base64-encode data_bytes and return (min QR version needed, b64 text)."""
-    b64_text = base64.b64encode(data_bytes).decode("ascii")
+def _b64(data_bytes):
+    """Base64-encode data_bytes."""
+    return base64.b64encode(data_bytes).decode("ascii")
+
+
+def _required_version_for_text(b64_text):
+    """Return the minimum QR version needed to hold b64_text in byte mode.
+
+    Mode is forced to MODE_8BIT_BYTE rather than left to the library's
+    auto-detection. base64 output can occasionally be alphanumeric-mode-
+    eligible (e.g. a run of zero bytes encodes as all 'A's), which needs
+    fewer bits than byte mode for the same character count. Since we probe
+    only the longest of the three channel strings and reuse its version for
+    the other two, that reuse is only safe if bit-cost is a pure function of
+    character count — which requires every channel to use the same mode.
+    """
     probe = qrcode.QRCode(error_correction=ERROR_CORRECT_L)
-    probe.add_data(b64_text)
+    probe.add_data(QRData(b64_text, mode=MODE_8BIT_BYTE))
     probe.make(fit=True)
-    return probe.version, b64_text
+    return probe.version
 
 
-def _make_channel_qr(b64_text, version, fill_color):
-    """Build a single-color QR image (any pixel != white counts as 'dark')."""
+def _make_channel_mask(b64_text, version):
+    """Build a single-channel ('L') mask: white modules on black background."""
     qr = qrcode.QRCode(
         version=version,
         error_correction=ERROR_CORRECT_L,
         box_size=BOX_SIZE,
         border=BORDER,
     )
-    qr.add_data(b64_text)
+    qr.add_data(QRData(b64_text, mode=MODE_8BIT_BYTE))
     qr.make(fit=False)
-    return qr.make_image(fill_color=fill_color, back_color="white").convert("RGB")
+    return qr.make_image(fill_color="white", back_color="black").convert("L")
 
-
-
-def _combine_channels(img_r, img_g, img_b):
-    if img_r.size != img_g.size or img_r.size != img_b.size:
-        raise ValueError("Channel QR images must be the same pixel size")
-    r=np.array(img_r)
-    g=np.array(img_g)
-    b=np.array(img_b)
-    rw=np.any(r!=255,axis=2)
-    gw=np.any(g!=255,axis=2)
-    bw=np.any(b!=255,axis=2)
-    out=np.stack([rw,gw,bw],axis=2).astype(np.uint8)*255
-    return Image.fromarray(out,"RGB")
 
 def _chunk_file(file_bytes, chunk_size):
     if not file_bytes:
@@ -80,46 +116,84 @@ def _chunk_file(file_bytes, chunk_size):
     return [file_bytes[i:i + chunk_size] for i in range(0, len(file_bytes), chunk_size)]
 
 
-
 def _encode_triplet_worker(args):
-    idx, triplet, output_dir=args
-    r_bytes,g_bytes,b_bytes=triplet
-    v_r,r_b64=_required_version(r_bytes)
-    v_g,g_b64=_required_version(g_bytes)
-    v_b,b_b64=_required_version(b_bytes)
-    version=max(v_r,v_g,v_b)
-    img_r=_make_channel_qr(r_b64,version,"red")
-    img_g=_make_channel_qr(g_b64,version,"green")
-    img_b=_make_channel_qr(b_b64,version,"blue")
-    combined=_combine_channels(img_r,img_g,img_b)
-    out_path=os.path.join(output_dir,f"{idx}.png")
-    combined.save(out_path)
-    return idx,out_path
+    idx, triplet = args
+    r_bytes, g_bytes, b_bytes = triplet
+    r_b64, g_b64, b_b64 = _b64(r_bytes), _b64(g_bytes), _b64(b_bytes)
 
-def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=None):
-    with open(file_path,"rb") as f: file_bytes=f.read()
-    total_size=len(file_bytes)
-    chunks=_chunk_file(file_bytes,chunk_size)
-    triplets=[]
-    for i in range(0,len(chunks),3):
-        t=chunks[i:i+3]
-        while len(t)<3:t.append(b"")
+    # Only probe once, using the longest of the three strings, instead of
+    # probing (and discarding) a QR code per channel.
+    longest = max((r_b64, g_b64, b_b64), key=len)
+    version = _required_version_for_text(longest)
+
+    mask_r = _make_channel_mask(r_b64, version)
+    mask_g = _make_channel_mask(g_b64, version)
+    mask_b = _make_channel_mask(b_b64, version)
+
+    # Native PIL channel merge (runs in C) instead of numpy array math.
+    combined = Image.merge("RGB", (mask_r, mask_g, mask_b))
+
+    buf = io.BytesIO()
+    combined.save(buf, format="PNG")
+    return idx, buf.getvalue()
+
+
+def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=None,
+                         memory_threshold_bytes=DEFAULT_MEMORY_THRESHOLD_BYTES):
+    if chunk_size > MAX_SAFE_CHUNK_SIZE:
+        raise ValueError(
+            f"chunk_size ({chunk_size}) is too large: once base64-encoded it "
+            f"would exceed the capacity of the largest QR code this tool can "
+            f"generate. Max safe chunk_size is {MAX_SAFE_CHUNK_SIZE} bytes."
+        )
+    with open(file_path, "rb") as f: file_bytes = f.read()
+    total_size = len(file_bytes)
+    chunks = _chunk_file(file_bytes, chunk_size)
+    triplets = []
+    for i in range(0, len(chunks), 3):
+        t = chunks[i:i + 3]
+        while len(t) < 3: t.append(b"")
         triplets.append(t)
     if os.path.exists(output_dir): shutil.rmtree(output_dir)
     os.makedirs(output_dir)
-    image_paths=[None]*len(triplets)
-    workers=min(os.cpu_count() or 1,len(triplets)) or 1
+
+    image_paths = [None] * len(triplets)
+
+    # Images are kept in memory (as encoded PNG bytes) and only written to
+    # disk once the buffered amount crosses memory_threshold_bytes, so disk
+    # I/O happens in fewer, larger bursts instead of once per image, without
+    # risking unbounded RAM growth.
+    buffered = {}
+    buffered_size = 0
+
+    def flush_buffer():
+        nonlocal buffered_size
+        for i, data in buffered.items():
+            path = os.path.join(output_dir, f"{i}.png")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            image_paths[i] = path
+        buffered.clear()
+        buffered_size = 0
+
+    workers = min(os.cpu_count() or 1, len(triplets)) or 1
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs=[ex.submit(_encode_triplet_worker,(i,t,output_dir)) for i,t in enumerate(triplets)]
-        done=0
+        futs = [ex.submit(_encode_triplet_worker, (i, t)) for i, t in enumerate(triplets)]
+        done = 0
         for f in as_completed(futs):
-            idx,path=f.result()
-            image_paths[idx]=path
-            done+=1
-            if progress_callback: progress_callback(done,len(triplets))
-    metadata={"original_filename":os.path.basename(file_path),"total_size":total_size,"chunk_size":chunk_size,"num_images":len(triplets)}
-    with open(os.path.join(output_dir,"metadata.json"),"w") as f: json.dump(metadata,f,indent=2)
-    return image_paths,metadata
+            idx, data = f.result()
+            buffered[idx] = data
+            buffered_size += len(data)
+            done += 1
+            if progress_callback: progress_callback(done, len(triplets))
+            if buffered_size >= memory_threshold_bytes:
+                flush_buffer()
+
+    flush_buffer()  # write out whatever's left in the buffer
+
+    metadata = {"original_filename": os.path.basename(file_path), "total_size": total_size, "chunk_size": chunk_size, "num_images": len(triplets)}
+    with open(os.path.join(output_dir, "metadata.json"), "w") as f: json.dump(metadata, f, indent=2)
+    return image_paths, metadata
 
 
 # --------------------------------------------------------------------------
@@ -152,6 +226,7 @@ class EncoderApp:
             "Enter MAX_QR_CODE_SIZE\n(bytes per channel, per QR code):",
             initialvalue=DEFAULT_MAX_QR_CODE_SIZE,
             minvalue=1,
+            maxvalue=MAX_SAFE_CHUNK_SIZE,
         )
         if not chunk_size:
             return
