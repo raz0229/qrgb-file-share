@@ -28,9 +28,9 @@ from PIL import Image, ImageTk
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import qrcode
-from qrcode.constants import ERROR_CORRECT_H
+from qrcode.constants import ERROR_CORRECT_L
 
-DEFAULT_MAX_QR_CODE_SIZE = 950  # bytes per channel, per QR code
+DEFAULT_MAX_QR_CODE_SIZE = 2213  # bytes per channel, per QR code (ERROR_CORRECT_H=950, ERROR_CORRECT_L=2213)
 BOX_SIZE = 6
 BORDER = 4
 
@@ -42,7 +42,7 @@ BORDER = 4
 def _required_version(data_bytes):
     """Base64-encode data_bytes and return (min QR version needed, b64 text)."""
     b64_text = base64.b64encode(data_bytes).decode("ascii")
-    probe = qrcode.QRCode(error_correction=ERROR_CORRECT_H)
+    probe = qrcode.QRCode(error_correction=ERROR_CORRECT_L)
     probe.add_data(b64_text)
     probe.make(fit=True)
     return probe.version, b64_text
@@ -52,7 +52,7 @@ def _make_channel_qr(b64_text, version, fill_color):
     """Build a single-color QR image (any pixel != white counts as 'dark')."""
     qr = qrcode.QRCode(
         version=version,
-        error_correction=ERROR_CORRECT_H,
+        error_correction=ERROR_CORRECT_L,
         box_size=BOX_SIZE,
         border=BORDER,
     )
