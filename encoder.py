@@ -31,7 +31,8 @@ import qrcode
 from qrcode.constants import ERROR_CORRECT_L
 from qrcode.util import QRData, MODE_8BIT_BYTE
 
-DEFAULT_MAX_QR_CODE_SIZE = 2213  # bytes per channel, per QR code (ERROR_CORRECT_H=950, ERROR_CORRECT_L=2213)
+# bytes per channel, per QR code (ERROR_CORRECT_H=950, ERROR_CORRECT_L=2213)
+DEFAULT_MAX_QR_CODE_SIZE = 2206 # Reserve some space for base64 overhead <n>, so this is a safe default.
 BOX_SIZE = 6
 BORDER = 4
 
@@ -55,7 +56,8 @@ def _max_safe_chunk_size():
     try:
         from qrcode import util as _qru, base as _qrbase
         version = 40
-        bit_limit = sum(b.data_count * 8 for b in _qrbase.rs_blocks(version, ERROR_CORRECT_L))
+        bit_limit = sum(
+            b.data_count * 8 for b in _qrbase.rs_blocks(version, ERROR_CORRECT_L))
         header_bits = 4 + _qru.length_in_bits(_qru.MODE_8BIT_BYTE, version)
         max_b64_chars = (bit_limit - header_bits) // 8
         best = 0
@@ -116,10 +118,14 @@ def _chunk_file(file_bytes, chunk_size):
     return [file_bytes[i:i + chunk_size] for i in range(0, len(file_bytes), chunk_size)]
 
 
-def _encode_triplet_worker(args):
+def _encode_triplet_worker(args, isMetaData=False):
     idx, triplet = args
     r_bytes, g_bytes, b_bytes = triplet
-    r_b64, g_b64, b_b64 = _b64(r_bytes), _b64(g_bytes), _b64(b_bytes)
+
+    # Prefix only the first (red) channel with the QRGB image number.
+    r_b64 = f"<{idx + 1}>{_b64(r_bytes)}" if not isMetaData else _b64(r_bytes)
+    g_b64 = _b64(g_bytes)
+    b_b64 = _b64(b_bytes)
 
     # Only probe once, using the longest of the three strings, instead of
     # probing (and discarding) a QR code per channel.
@@ -139,22 +145,25 @@ def _encode_triplet_worker(args):
 
 
 def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=None,
-                         memory_threshold_bytes=DEFAULT_MEMORY_THRESHOLD_BYTES):
+                        memory_threshold_bytes=DEFAULT_MEMORY_THRESHOLD_BYTES):
     if chunk_size > MAX_SAFE_CHUNK_SIZE:
         raise ValueError(
             f"chunk_size ({chunk_size}) is too large: once base64-encoded it "
             f"would exceed the capacity of the largest QR code this tool can "
             f"generate. Max safe chunk_size is {MAX_SAFE_CHUNK_SIZE} bytes."
         )
-    with open(file_path, "rb") as f: file_bytes = f.read()
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
     total_size = len(file_bytes)
     chunks = _chunk_file(file_bytes, chunk_size)
     triplets = []
     for i in range(0, len(chunks), 3):
         t = chunks[i:i + 3]
-        while len(t) < 3: t.append(b"")
+        while len(t) < 3:
+            t.append(b"")
         triplets.append(t)
-    if os.path.exists(output_dir): shutil.rmtree(output_dir)
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
     os.makedirs(output_dir)
 
     image_paths = [None] * len(triplets)
@@ -169,7 +178,7 @@ def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=Non
     def flush_buffer():
         nonlocal buffered_size
         for i, data in buffered.items():
-            path = os.path.join(output_dir, f"{i}.png")
+            path = os.path.join(output_dir, f"{i+1}.png")
             with open(path, "wb") as fh:
                 fh.write(data)
             image_paths[i] = path
@@ -178,21 +187,44 @@ def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=Non
 
     workers = min(os.cpu_count() or 1, len(triplets)) or 1
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_encode_triplet_worker, (i, t)) for i, t in enumerate(triplets)]
+        futs = [ex.submit(_encode_triplet_worker, (i, t))
+                for i, t in enumerate(triplets)]
         done = 0
         for f in as_completed(futs):
             idx, data = f.result()
             buffered[idx] = data
             buffered_size += len(data)
             done += 1
-            if progress_callback: progress_callback(done, len(triplets))
+            if progress_callback:
+                progress_callback(done, len(triplets))
             if buffered_size >= memory_threshold_bytes:
                 flush_buffer()
 
     flush_buffer()  # write out whatever's left in the buffer
 
-    metadata = {"original_filename": os.path.basename(file_path), "total_size": total_size, "chunk_size": chunk_size, "num_images": len(triplets)}
-    with open(os.path.join(output_dir, "metadata.json"), "w") as f: json.dump(metadata, f, indent=2)
+    metadata = {
+        "original_filename": os.path.basename(file_path),
+        "total_size": total_size,
+        "chunk_size": chunk_size,
+        "num_images": len(triplets),
+    }
+
+
+    metadata_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+
+    # Metadata should comfortably fit in a single QRGB.
+    meta_chunks = _chunk_file(metadata_bytes, chunk_size)
+    if len(meta_chunks) > 3:
+        raise ValueError(
+            "Metadata is too large to fit into a single QRGB image."
+        )
+    while len(meta_chunks) < 3:
+        meta_chunks.append(b"")
+
+    _, meta_png = _encode_triplet_worker((0, meta_chunks[:3]), isMetaData=True)
+
+    with open(os.path.join(output_dir, "0.png"), "wb") as f:
+        f.write(meta_png)
     return image_paths, metadata
 
 
@@ -209,11 +241,13 @@ class EncoderApp:
         self.image_paths = []
         self.current_index = 0
 
-        tk.Label(root, text="QRGB Encoder", font=("Arial", 16, "bold")).pack(pady=10)
+        tk.Label(root, text="QRGB Encoder", font=(
+            "Arial", 16, "bold")).pack(pady=10)
         tk.Button(
             root, text="Select File to Encode", command=self.select_file, width=25
         ).pack(pady=10)
-        self.status_label = tk.Label(root, text="", wraplength=390, justify="left")
+        self.status_label = tk.Label(
+            root, text="", wraplength=390, justify="left")
         self.status_label.pack(pady=10)
 
     def select_file(self):
@@ -239,7 +273,8 @@ class EncoderApp:
         self.root.update()
 
         def progress(done, total):
-            self.status_label.config(text=f"Encoding QRGB code {done}/{total}...")
+            self.status_label.config(
+                text=f"Encoding QRGB code {done}/{total}...")
             self.root.update_idletasks()
 
         try:
@@ -289,7 +324,8 @@ class EncoderApp:
                     f"{os.path.basename(path)}"
                 )
             )
-            prev_btn.config(state=tk.NORMAL if self.current_index > 0 else tk.DISABLED)
+            prev_btn.config(
+                state=tk.NORMAL if self.current_index > 0 else tk.DISABLED)
             next_btn.config(
                 state=tk.NORMAL
                 if self.current_index < len(self.image_paths) - 1
@@ -306,10 +342,12 @@ class EncoderApp:
                 self.current_index -= 1
                 render()
 
-        prev_btn = tk.Button(nav_frame, text="< Previous", command=go_prev, width=12)
+        prev_btn = tk.Button(nav_frame, text="< Previous",
+                             command=go_prev, width=12)
         prev_btn.grid(row=0, column=0, padx=5)
 
-        next_btn = tk.Button(nav_frame, text="Next >", command=go_next, width=12)
+        next_btn = tk.Button(nav_frame, text="Next >",
+                             command=go_next, width=12)
         next_btn.grid(row=0, column=1, padx=5)
 
         render()
