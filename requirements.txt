@@ -1,5 +1,6 @@
-qrcode[pil]
+zint
 Pillow
 opencv-python
 numpy
 pyzbar
+

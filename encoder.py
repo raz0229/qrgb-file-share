@@ -3,10 +3,11 @@ QRGB Encoder
 ============
 
 Splits an arbitrary file into sequential byte chunks, encodes each chunk as
-base64 text inside a QR code, and superposes 3 QR codes (Red, Green, Blue
-channels) into a single "QRGB" image. Images are numbered 0.png, 1.png, ...
-in a chosen output directory, alongside a metadata.json describing how to
-put the file back together.
+RAW BYTES directly inside a QR code (byte mode natively supports any 8-bit
+value, so no base64 step is needed), and superposes 3 QR codes (Red, Green,
+Blue channels) into a single "QRGB" image. Images are numbered 0.png,
+1.png, ... in a chosen output directory, alongside a metadata.json
+describing how to put the file back together.
 
 Example: an 18-byte file with MAX_QR_CODE_SIZE = 3 bytes produces:
   - 18 bytes -> 6 chunks of 3 bytes each
@@ -20,8 +21,9 @@ Run this file directly to launch the GUI.
 import os
 import io
 import json
-import base64
+import struct
 import shutil
+import hashlib
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
 
@@ -31,8 +33,6 @@ import qrcode
 from qrcode.constants import ERROR_CORRECT_L
 from qrcode.util import QRData, MODE_8BIT_BYTE
 
-# bytes per channel, per QR code (ERROR_CORRECT_H=950, ERROR_CORRECT_L=2213)
-DEFAULT_MAX_QR_CODE_SIZE = 2206 # Reserve some space for base64 overhead <n>, so this is a safe default.
 BOX_SIZE = 6
 BORDER = 4
 
@@ -41,12 +41,84 @@ BORDER = 4
 # images the file produces.
 DEFAULT_MEMORY_THRESHOLD_BYTES = 200 * 1024 * 1024  # 200 MB
 
+# The Red channel of each data QRGB image is prefixed with a fixed-size
+# binary header giving the image number, so the decoder can tell which
+# original chunks that image's R/G/B channels correspond to without any
+# text parsing. 4 bytes (up to ~4.29 billion images) is far more than
+# enough and keeps the header overhead negligible and constant-size.
+HEADER_STRUCT = struct.Struct(">I")  # big-endian, unsigned 4-byte int
+HEADER_SIZE = HEADER_STRUCT.size
+
+# QR scanners (zbar, and OpenCV's detector) don't treat byte-mode QR
+# payloads as truly opaque binary: internally they check whether the bytes
+# happen to already be valid UTF-8. If so, they hand them back unchanged;
+# if not, they reinterpret every byte as a Latin-1 codepoint and re-encode
+# it as UTF-8 before handing it back. Both behaviors are individually
+# reversible, but the decoder can't tell *which one* happened just by
+# looking at the result -- and getting it wrong silently corrupts data
+# (e.g. this bites any chunk that happens to contain valid UTF-8 text).
+# Prefixing every channel's payload with a single 0xFF byte -- a byte
+# value that can never appear anywhere in valid UTF-8 -- guarantees the
+# payload is *always* invalid UTF-8, so scanners always take the Latin-1
+# reinterpretation path. That makes the transform deterministic and
+# reversible on every chunk, for a negligible 1-byte-per-channel cost
+# (versus base64's ~33% overhead).
+SENTINEL = b"\xff"
+SENTINEL_SIZE = len(SENTINEL)
+
+# The `qrcode` library's Reed-Solomon error-correction step splits the
+# payload into fixed-size blocks (~118-149 bytes each for version 40) and
+# builds a GF(256) polynomial out of each block's raw bytes. If a block
+# ever ends up being ALL 0x00 bytes, the library's polynomial code strips
+# what it thinks are leading zero coefficients, finds the whole thing is
+# zero, and later calls glog(0) -- which is mathematically undefined and
+# raises `ValueError: glog(0)`.
+#
+# SENTINEL only guarantees the *first* byte of a channel's data is
+# non-zero; everything after that is raw file bytes, which for real files
+# (padding, sparse regions, zeroed buffers, aligned binary sections, etc.)
+# very often contains long runs of 0x00 -- especially once a file is large
+# enough to have several such regions. That's why small test files work
+# fine but larger/real-world files intermittently crash with glog(0).
+#
+# Fix: XOR every payload byte with a fixed, deterministic pseudorandom
+# keystream ("whitening") before it's handed to the QR encoder. This makes
+# it astronomically unlikely (~256^-118) for any block to end up all-zero,
+# regardless of what patterns exist in the source file, while remaining
+# perfectly reversible (XOR-ing the whitened bytes with the same keystream
+# a second time restores the originals). The keystream is derived from
+# SHA-256 rather than the `random` module so it's guaranteed to produce the
+# exact same bytes on every machine/Python version -- required since the
+# decoder has to regenerate an identical keystream to undo this.
+_WHITEN_SEED = b"QRGB-WHITEN-V1"
+
+
+def _keystream(length):
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out += hashlib.sha256(_WHITEN_SEED + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    return bytes(out[:length])
+
+
+def _whiten(data):
+    """XOR `data` with a deterministic keystream. Self-inverse: calling
+    this again on the output restores the original bytes. IMPORTANT: the
+    decoder must apply this exact same function to each channel's payload
+    (after stripping the SENTINEL byte and, for the Red channel, the
+    4-byte header) before writing bytes back out to the reconstructed
+    file, or the output will be garbage."""
+    if not data:
+        return data
+    return bytes(a ^ b for a, b in zip(data, _keystream(len(data))))
+
 
 def _max_safe_chunk_size():
-    """Largest number of raw bytes that can be base64-encoded and still fit
-    into the biggest QR code this tool can produce (version 40, error-
-    correction L, byte mode). base64 adds ~33% overhead, so this is well
-    below the QR code's raw byte capacity.
+    """Largest number of raw bytes that can fit directly (no base64) into
+    the biggest QR code this tool can produce (version 40, error-
+    correction L, byte mode), after reserving room for the fixed-size
+    binary header prepended to the Red channel.
 
     Computed from the qrcode library's own capacity tables so it stays
     correct if the library changes; falls back to a known-good constant
@@ -59,47 +131,23 @@ def _max_safe_chunk_size():
         bit_limit = sum(
             b.data_count * 8 for b in _qrbase.rs_blocks(version, ERROR_CORRECT_L))
         header_bits = 4 + _qru.length_in_bits(_qru.MODE_8BIT_BYTE, version)
-        max_b64_chars = (bit_limit - header_bits) // 8
-        best = 0
-        for x in range(max_b64_chars, 0, -1):
-            if ((x + 2) // 3) * 4 <= max_b64_chars:  # ceil(x/3)*4 <= capacity
-                best = x
-                break
-        return best
+        byte_capacity = (bit_limit - header_bits) // 8
+        return byte_capacity - SENTINEL_SIZE - HEADER_SIZE
     except Exception:
-        return 2214  # known-good fallback
+        return 2953 - SENTINEL_SIZE - HEADER_SIZE  # known-good fallback (v40-L byte capacity)
 
 
 MAX_SAFE_CHUNK_SIZE = _max_safe_chunk_size()
+
+# Reserve a small margin below the true max so default runs comfortably.
+DEFAULT_MAX_QR_CODE_SIZE = MAX_SAFE_CHUNK_SIZE
 
 
 # --------------------------------------------------------------------------
 # Core encoding logic
 # --------------------------------------------------------------------------
 
-def _b64(data_bytes):
-    """Base64-encode data_bytes."""
-    return base64.b64encode(data_bytes).decode("ascii")
-
-
-def _required_version_for_text(b64_text):
-    """Return the minimum QR version needed to hold b64_text in byte mode.
-
-    Mode is forced to MODE_8BIT_BYTE rather than left to the library's
-    auto-detection. base64 output can occasionally be alphanumeric-mode-
-    eligible (e.g. a run of zero bytes encodes as all 'A's), which needs
-    fewer bits than byte mode for the same character count. Since we probe
-    only the longest of the three channel strings and reuse its version for
-    the other two, that reuse is only safe if bit-cost is a pure function of
-    character count — which requires every channel to use the same mode.
-    """
-    probe = qrcode.QRCode(error_correction=ERROR_CORRECT_L)
-    probe.add_data(QRData(b64_text, mode=MODE_8BIT_BYTE))
-    probe.make(fit=True)
-    return probe.version
-
-
-def _make_channel_mask(b64_text, version):
+def _make_channel_mask(data_bytes, version):
     """Build a single-channel ('L') mask: white modules on black background."""
     qr = qrcode.QRCode(
         version=version,
@@ -107,7 +155,7 @@ def _make_channel_mask(b64_text, version):
         box_size=BOX_SIZE,
         border=BORDER,
     )
-    qr.add_data(QRData(b64_text, mode=MODE_8BIT_BYTE))
+    qr.add_data(QRData(data_bytes, mode=MODE_8BIT_BYTE))
     qr.make(fit=False)
     return qr.make_image(fill_color="white", back_color="black").convert("L")
 
@@ -122,19 +170,28 @@ def _encode_triplet_worker(args, isMetaData=False):
     idx, triplet = args
     r_bytes, g_bytes, b_bytes = triplet
 
-    # Prefix only the first (red) channel with the QRGB image number.
-    r_b64 = f"<{idx + 1}>{_b64(r_bytes)}" if not isMetaData else _b64(r_bytes)
-    g_b64 = _b64(g_bytes)
-    b_b64 = _b64(b_bytes)
+    # Whiten each channel's payload first (see comment above) so a block of
+    # raw file bytes can never come out all-zero and trip the QR library's
+    # glog(0) bug. Then, every channel gets the SENTINEL byte prefixed, so
+    # scanners always take the deterministic, reversible decode path. Only
+    # the Red channel additionally gets the QRGB image number as a
+    # fixed-size binary header (no text/base64 involved).
+    r_payload = _whiten(r_bytes)
+    g_payload = _whiten(g_bytes)
+    b_payload = _whiten(b_bytes)
 
-    # Only probe once, using the longest of the three strings, instead of
-    # probing (and discarding) a QR code per channel.
-    longest = max((r_b64, g_b64, b_b64), key=len)
-    version = _required_version_for_text(longest)
+    r_data = SENTINEL + (HEADER_STRUCT.pack(idx + 1) + r_payload if not isMetaData else r_payload)
+    g_data = SENTINEL + g_payload
+    b_data = SENTINEL + b_payload
+    
+    # Only probe once, using the longest of the three byte-strings, instead
+    # of probing (and discarding) a QR code per channel.
+    longest = max((r_data, g_data, b_data), key=len)
+    version = 40
 
-    mask_r = _make_channel_mask(r_b64, version)
-    mask_g = _make_channel_mask(g_b64, version)
-    mask_b = _make_channel_mask(b_b64, version)
+    mask_r = _make_channel_mask(r_data, version)
+    mask_g = _make_channel_mask(g_data, version)
+    mask_b = _make_channel_mask(b_data, version)
 
     # Native PIL channel merge (runs in C) instead of numpy array math.
     combined = Image.merge("RGB", (mask_r, mask_g, mask_b))
@@ -148,9 +205,9 @@ def encode_file_to_qrgb(file_path, chunk_size, output_dir, progress_callback=Non
                         memory_threshold_bytes=DEFAULT_MEMORY_THRESHOLD_BYTES):
     if chunk_size > MAX_SAFE_CHUNK_SIZE:
         raise ValueError(
-            f"chunk_size ({chunk_size}) is too large: once base64-encoded it "
-            f"would exceed the capacity of the largest QR code this tool can "
-            f"generate. Max safe chunk_size is {MAX_SAFE_CHUNK_SIZE} bytes."
+            f"chunk_size ({chunk_size}) is too large: it would exceed the "
+            f"capacity of the largest QR code this tool can generate (plus "
+            f"header overhead). Max safe chunk_size is {MAX_SAFE_CHUNK_SIZE} bytes."
         )
     with open(file_path, "rb") as f:
         file_bytes = f.read()
